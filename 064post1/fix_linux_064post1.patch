@@ -1,0 +1,408 @@
+diff --git a/vllm/engine/metrics.py b/vllm/engine/metrics.py
+index e896bcdde..61ace7e8f 100644
+--- a/vllm/engine/metrics.py
++++ b/vllm/engine/metrics.py
+@@ -444,22 +444,23 @@ class LoggingStatLogger(StatLoggerBase):
+                 self.num_generation_tokens,
+                 now=stats.now,
+                 last_log=self.last_local_log)
+-
++        
+             # Log to stdout.
+-            logger.info(
+-                "Avg prompt throughput: %.1f tokens/s, "
+-                "Avg generation throughput: %.1f tokens/s, "
+-                "Running: %d reqs, Swapped: %d reqs, "
+-                "Pending: %d reqs, GPU KV cache usage: %.1f%%, "
+-                "CPU KV cache usage: %.1f%%.",
+-                prompt_throughput,
+-                generation_throughput,
+-                stats.num_running_sys,
+-                stats.num_swapped_sys,
+-                stats.num_waiting_sys,
+-                stats.gpu_cache_usage_sys * 100,
+-                stats.cpu_cache_usage_sys * 100,
+-            )
++            if generation_throughput>0:
++                logger.info(
++                    "Avg prompt throughput: %.1f tokens/s, "
++                    "Avg generation throughput: %.1f tokens/s, "
++                    "Running: %d reqs, Swapped: %d reqs, "
++                    "Pending: %d reqs, GPU KV cache usage: %.1f%%, "
++                    "CPU KV cache usage: %.1f%%.",
++                    prompt_throughput,
++                    generation_throughput,
++                    stats.num_running_sys,
++                    stats.num_swapped_sys,
++                    stats.num_waiting_sys,
++                    stats.gpu_cache_usage_sys * 100,
++                    stats.cpu_cache_usage_sys * 100,
++                )
+             if (stats.cpu_prefix_cache_hit_rate >= 0
+                     or stats.gpu_prefix_cache_hit_rate >= 0):
+                 logger.info(
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index b13f6a228..90b5b48d6 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -542,6 +542,7 @@ def init_app_state(
+         enable_auto_tools=args.enable_auto_tool_choice,
+         tool_parser=args.tool_call_parser,
+         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
++        max_req_time=args.max_req_time,
+     ) if model_config.task == "generate" else None
+     state.openai_serving_completion = OpenAIServingCompletion(
+         engine_client,
+@@ -551,6 +552,7 @@ def init_app_state(
+         prompt_adapters=args.prompt_adapters,
+         request_logger=request_logger,
+         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
++        max_req_time=args.max_req_time,
+     ) if model_config.task == "generate" else None
+     state.openai_serving_embedding = OpenAIServingEmbedding(
+         engine_client,
+@@ -558,6 +560,7 @@ def init_app_state(
+         base_model_paths,
+         request_logger=request_logger,
+         chat_template=args.chat_template,
++        max_req_time=args.max_req_time,
+     ) if model_config.task == "embedding" else None
+     state.openai_serving_tokenization = OpenAIServingTokenization(
+         engine_client,
+diff --git a/vllm/entrypoints/openai/cli_args.py b/vllm/entrypoints/openai/cli_args.py
+index eb08a8929..2e776f535 100644
+--- a/vllm/entrypoints/openai/cli_args.py
++++ b/vllm/entrypoints/openai/cli_args.py
+@@ -234,6 +234,18 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
+         default=False,
+         help="If set to True, enable prompt_tokens_details in usage.")
+ 
++    # Maximum wall-clock time per request before auto-abort
++    parser.add_argument(
++        "--max-req-time",
++        dest="max_req_time",
++        type=int,
++        default=300,
++        help=(
++            "Maximum wall-clock time in seconds allowed for a single request. "
++            "If exceeded, the request will be aborted. Default: 300"
++        ),
++    )
++
+     return parser
+ 
+ 
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 820aefd88..d102f7463 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -301,6 +301,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             "not set it, a random_uuid will be generated. This id is used "
+             "through out the inference process and return in response."))
+ 
++    # Per-request override for max wall-clock time (seconds). If set to 0 or
++    # negative, timeout is disabled for this request. If None, server default
++    # (--max-req-time) is used.
++    max_req_time: Optional[int] = Field(default=None)
++
+     # doc: end-chat-completion-extra-params
+ 
+     def to_beam_search_params(self,
+@@ -607,6 +612,11 @@ class CompletionRequest(OpenAIBaseModel):
+             "default: 0). Any priority other than 0 will raise an error "
+             "if the served model does not use priority scheduling."))
+ 
++    # Per-request override for max wall-clock time (seconds). If set to 0 or
++    # negative, timeout is disabled for this request. If None, server default
++    # (--max-req-time) is used.
++    max_req_time: Optional[int] = Field(default=None)
++
+     # doc: end-completion-extra-params
+ 
+     def to_beam_search_params(self,
+@@ -747,6 +757,11 @@ class EmbeddingCompletionRequest(OpenAIBaseModel):
+             "default: 0). Any priority other than 0 will raise an error "
+             "if the served model does not use priority scheduling."))
+ 
++    # Per-request override for max wall-clock time (seconds). If set to 0 or
++    # negative, timeout is disabled for this request. If None, server default
++    # (--max-req-time) is used.
++    max_req_time: Optional[int] = Field(default=None)
++
+     # doc: end-embedding-extra-params
+ 
+     def to_pooling_params(self):
+@@ -811,6 +826,11 @@ class EmbeddingChatRequest(OpenAIBaseModel):
+             "The priority of the request (lower means earlier handling; "
+             "default: 0). Any priority other than 0 will raise an error "
+             "if the served model does not use priority scheduling."))
++
++    # Per-request override for max wall-clock time (seconds). If set to 0 or
++    # negative, timeout is disabled for this request. If None, server default
++    # (--max-req-time) is used.
++    max_req_time: Optional[int] = Field(default=None)
+     # doc: end-chat-embedding-extra-params
+ 
+     @model_validator(mode="before")
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 77cae00ae..e836fa9c7 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import json
+ import time
++from http import HTTPStatus
+ from typing import (AsyncGenerator, AsyncIterator, Callable, Dict, Final, List,
+                     Optional)
+ from typing import Sequence as GenericSequence
+@@ -51,14 +52,16 @@ class OpenAIServingChat(OpenAIServing):
+                  return_tokens_as_token_ids: bool = False,
+                  enable_auto_tools: bool = False,
+                  tool_parser: Optional[str] = None,
+-                 enable_prompt_tokens_details: bool = False):
++                 enable_prompt_tokens_details: bool = False,
++                 max_req_time: int = 300):
+         super().__init__(engine_client=engine_client,
+                          model_config=model_config,
+                          base_model_paths=base_model_paths,
+                          lora_modules=lora_modules,
+                          prompt_adapters=prompt_adapters,
+                          request_logger=request_logger,
+-                         return_tokens_as_token_ids=return_tokens_as_token_ids)
++                         return_tokens_as_token_ids=return_tokens_as_token_ids,
++                         max_req_time=max_req_time)
+ 
+         self.response_role = response_role
+         self.use_tool_use_model_template = False
+@@ -227,6 +230,12 @@ class OpenAIServingChat(OpenAIServing):
+         if raw_request:
+             result_generator = iterate_with_cancellation(
+                 result_generator, raw_request.is_disconnected)
++            # Enforce overall timeout if configured (per-request override wins)
++            per_req_timeout = request.max_req_time
++            timeout_to_use = (self.max_req_time if per_req_timeout is None
++                              else per_req_timeout)
++            result_generator = self._wrap_with_timeout(
++                result_generator, [request_id], timeout_to_use)
+ 
+         # Streaming response
+         if request.stream:
+@@ -241,6 +250,9 @@ class OpenAIServingChat(OpenAIServing):
+         except ValueError as e:
+             # TODO: Use a vllm-specific Validation Error
+             return self.create_error_response(str(e))
++        except asyncio.TimeoutError:
++            return self.create_error_response("Request timed out",
++                                             status_code=HTTPStatus.REQUEST_TIMEOUT)
+ 
+     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
+         if request.add_generation_prompt:
+@@ -577,6 +589,12 @@ class OpenAIServingChat(OpenAIServing):
+             logger.exception("Error in chat completion stream generator.")
+             data = self.create_streaming_error_response(str(e))
+             yield f"data: {data}\n\n"
++        except asyncio.TimeoutError:
++            data = self.create_streaming_error_response(
++                "Request timed out",
++                status_code=HTTPStatus.REQUEST_TIMEOUT,
++            )
++            yield f"data: {data}\n\n"
+         # Send the final done message after all response.n are finished
+         yield "data: [DONE]\n\n"
+ 
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index 936aae8f1..c7335e798 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -1,5 +1,6 @@
+ import asyncio
+ import time
++from http import HTTPStatus
+ from typing import AsyncGenerator, AsyncIterator, Dict, List, Optional
+ from typing import Sequence as GenericSequence
+ from typing import Tuple, Union, cast
+@@ -47,6 +48,7 @@ class OpenAIServingCompletion(OpenAIServing):
+         prompt_adapters: Optional[List[PromptAdapterPath]],
+         request_logger: Optional[RequestLogger],
+         return_tokens_as_token_ids: bool = False,
++        max_req_time: int = 300,
+     ):
+         super().__init__(engine_client=engine_client,
+                          model_config=model_config,
+@@ -54,7 +56,8 @@ class OpenAIServingCompletion(OpenAIServing):
+                          lora_modules=lora_modules,
+                          prompt_adapters=prompt_adapters,
+                          request_logger=request_logger,
+-                         return_tokens_as_token_ids=return_tokens_as_token_ids)
++                         return_tokens_as_token_ids=return_tokens_as_token_ids,
++                         max_req_time=max_req_time)
+ 
+     async def create_completion(
+         self,
+@@ -161,6 +164,13 @@ class OpenAIServingCompletion(OpenAIServing):
+ 
+         result_generator = merge_async_iterators(
+             *generators, is_cancelled=raw_request.is_disconnected)
++        # Enforce overall timeout if configured (per-request override wins)
++        per_req_timeout = request.max_req_time
++        timeout_to_use = (self.max_req_time if per_req_timeout is None
++                          else per_req_timeout)
++        result_generator = self._wrap_with_timeout(
++            result_generator, [f"{request_id}-{i}" for i in range(num_prompts)],
++            timeout_to_use)
+ 
+         num_prompts = len(engine_prompts)
+ 
+@@ -212,6 +222,9 @@ class OpenAIServingCompletion(OpenAIServing):
+             )
+         except asyncio.CancelledError:
+             return self.create_error_response("Client disconnected")
++        except asyncio.TimeoutError:
++            return self.create_error_response("Request timed out",
++                                             status_code=HTTPStatus.REQUEST_TIMEOUT)
+         except ValueError as e:
+             # TODO: Use a vllm-specific Validation Error
+             return self.create_error_response(str(e))
+@@ -372,6 +385,12 @@ class OpenAIServingCompletion(OpenAIServing):
+             # TODO: Use a vllm-specific Validation Error
+             data = self.create_streaming_error_response(str(e))
+             yield f"data: {data}\n\n"
++        except asyncio.TimeoutError:
++            data = self.create_streaming_error_response(
++                "Request timed out",
++                status_code=HTTPStatus.REQUEST_TIMEOUT,
++            )
++            yield f"data: {data}\n\n"
+         yield "data: [DONE]\n\n"
+ 
+     def request_output_to_completion_response(
+diff --git a/vllm/entrypoints/openai/serving_embedding.py b/vllm/entrypoints/openai/serving_embedding.py
+index bbe7db8f1..c1e4a4a98 100644
+--- a/vllm/entrypoints/openai/serving_embedding.py
++++ b/vllm/entrypoints/openai/serving_embedding.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import base64
+ import time
++from http import HTTPStatus
+ from typing import AsyncGenerator, List, Literal, Optional, Union, cast
+ 
+ import numpy as np
+@@ -77,13 +78,15 @@ class OpenAIServingEmbedding(OpenAIServing):
+         *,
+         request_logger: Optional[RequestLogger],
+         chat_template: Optional[str],
++        max_req_time: int = 300,
+     ):
+         super().__init__(engine_client=engine_client,
+                          model_config=model_config,
+                          base_model_paths=base_model_paths,
+                          lora_modules=None,
+                          prompt_adapters=None,
+-                         request_logger=request_logger)
++                         request_logger=request_logger,
++                         max_req_time=max_req_time)
+ 
+         self.chat_template = load_chat_template(chat_template)
+ 
+@@ -196,6 +199,13 @@ class OpenAIServingEmbedding(OpenAIServing):
+             *generators,
+             is_cancelled=raw_request.is_disconnected if raw_request else None,
+         )
++        # Enforce overall timeout if configured (per-request override wins)
++        per_req_timeout = request.max_req_time if hasattr(request, "max_req_time") else None
++        timeout_to_use = (self.max_req_time if per_req_timeout is None
++                          else per_req_timeout)
++        result_generator = self._wrap_with_timeout(
++            result_generator, [f"{request_id}-{i}" for i in range(num_prompts)],
++            timeout_to_use)
+ 
+         num_prompts = len(engine_prompts)
+ 
+@@ -216,6 +226,9 @@ class OpenAIServingEmbedding(OpenAIServing):
+                 encoding_format)
+         except asyncio.CancelledError:
+             return self.create_error_response("Client disconnected")
++        except asyncio.TimeoutError:
++            return self.create_error_response("Request timed out",
++                                             status_code=HTTPStatus.REQUEST_TIMEOUT)
+         except ValueError as e:
+             # TODO: Use a vllm-specific Validation Error
+             return self.create_error_response(str(e))
+diff --git a/vllm/entrypoints/openai/serving_engine.py b/vllm/entrypoints/openai/serving_engine.py
+index fa315fa51..73630cf44 100644
+--- a/vllm/entrypoints/openai/serving_engine.py
++++ b/vllm/entrypoints/openai/serving_engine.py
+@@ -1,9 +1,11 @@
++import asyncio
+ import json
+ import pathlib
++import time
+ from dataclasses import dataclass
+ from http import HTTPStatus
+ from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
+-                    Optional, Sequence, Tuple, TypedDict, Union)
++                    Optional, Sequence, Tuple, TypedDict, Union, AsyncIterator)
+ 
+ from pydantic import Field
+ from starlette.datastructures import Headers
+@@ -98,6 +100,7 @@ class OpenAIServing:
+         prompt_adapters: Optional[List[PromptAdapterPath]],
+         request_logger: Optional[RequestLogger],
+         return_tokens_as_token_ids: bool = False,
++        max_req_time: int = 300,
+     ):
+         super().__init__()
+ 
+@@ -137,6 +140,50 @@ class OpenAIServing:
+ 
+         self.request_logger = request_logger
+         self.return_tokens_as_token_ids = return_tokens_as_token_ids
++        # Maximum wall-clock time per request (seconds). If <= 0, disabled.
++        self.max_req_time = max_req_time
++
++    async def _abort_all(self, request_ids: List[str]) -> None:
++        for rid in request_ids:
++            try:
++                await self.engine_client.abort(rid)
++            except Exception:
++                # Best-effort abort; ignore errors (e.g., already finished)
++                pass
++
++    async def _wrap_with_timeout(self,
++                                 iterator: AsyncIterator,
++                                 request_ids: List[str],
++                                 timeout_s: Optional[int]) -> AsyncIterator:
++        """Wrap an async iterator, enforcing an overall deadline.
++
++        If the deadline elapses, abort provided request_ids and raise
++        asyncio.TimeoutError to the caller.
++        """
++        if timeout_s is None or timeout_s <= 0:
++            # No timeout; return original iterator
++            async for item in iterator:
++                yield item
++            return
++
++        start_ts = time.monotonic()
++        deadline = start_ts + float(timeout_s)
++
++        # Pull items with remaining-time budget per next()
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                await self._abort_all(request_ids)
++                raise asyncio.TimeoutError("request timed out")
++            try:
++                next_item = await asyncio.wait_for(iterator.__anext__(),
++                                                   timeout=remaining)
++            except StopAsyncIteration:
++                return
++            except asyncio.TimeoutError:
++                await self._abort_all(request_ids)
++                raise
++            yield next_item
+ 
+     async def show_available_models(self) -> ModelList:
+         """Show available models. Right now we only have one model."""
