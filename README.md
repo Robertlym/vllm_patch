@@ -94,5 +94,3 @@ patching file vllm/entrypoints/openai/api_server.py
 ```
 
 表示补丁应用完成。
-
-```
